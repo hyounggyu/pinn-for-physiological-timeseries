@@ -19,8 +19,8 @@ class ModelConfig:
     n_ext: int = 100
     learning_rate: float = 3e-4
     batch_size: int = 32
-    epochs: int = 5000
-    seed: int = 42
+    epochs: int = 300
+    seed: int = 123
     physics_loss_weight: float = 10.0
 
 
@@ -109,19 +109,40 @@ class PinnTrainer:
         self.config = config
         self.optimizer = torch.optim.Adam(model.parameters(), lr=config.learning_rate)
 
-    def compute_physics_loss(self, pred, feat1, feat2, feat3):
-        grad_feat1 = torch.autograd.grad(pred.sum(), feat1, create_graph=True)[0]
-        grad_feat2 = torch.autograd.grad(pred.sum(), feat2, create_graph=True)[0]
-        grad_feat3 = torch.autograd.grad(pred.sum(), feat3, create_graph=True)[0]
+    def save_model(self, path):
+        """
+        모델의 가중치와 함께 스케일러 정보도 저장합니다.
+        Args:
+            path: 모델을 저장할 경로
+        """
+        model_state = {
+            "model_state_dict": self.model.state_dict(),
+            "model_config": {
+                "n_input": self.model.n_input,
+                "n_feat": self.model.n_feat,
+                "n_ext": self.model.n_ext,
+                "learning_rate": self.config.learning_rate,
+                "batch_size": self.config.batch_size,
+                "epochs": self.config.epochs,
+                "seed": self.config.seed,
+                "physics_loss_weight": self.config.physics_loss_weight,
+            }
+        }
+        torch.save(model_state, path)
 
-        physics_pred = (
-            pred[:-1]
-            + grad_feat1[:-1] * (feat1[1:] - feat1[:-1])
-            + grad_feat2[:-1] * (feat2[1:] - feat2[:-1])
-            + grad_feat3[:-1] * (feat3[1:] - feat3[:-1])
-        )
+    # def compute_physics_loss(self, pred, feat1, feat2, feat3):
+    #     grad_feat1 = torch.autograd.grad(pred.sum(), feat1, create_graph=True)[0]
+    #     grad_feat2 = torch.autograd.grad(pred.sum(), feat2, create_graph=True)[0]
+    #     grad_feat3 = torch.autograd.grad(pred.sum(), feat3, create_graph=True)[0]
 
-        return F.mse_loss(physics_pred, pred[1:])
+    #     physics_pred = (
+    #         pred[:-1]
+    #         + grad_feat1[:-1] * (feat1[1:] - feat1[:-1])
+    #         + grad_feat2[:-1] * (feat2[1:] - feat2[:-1])
+    #         + grad_feat3[:-1] * (feat3[1:] - feat3[:-1])
+    #     )
+
+    #     return F.mse_loss(physics_pred, pred[1:])
 
     def train_epoch(self, train_loader):
         self.model.train()
@@ -130,6 +151,7 @@ class PinnTrainer:
         for batch in train_loader:
             beat, feat1, feat2, feat3, target = [b.to(self.device) for b in batch]
 
+            beat.requires_grad = True
             feat1.requires_grad = True
             feat2.requires_grad = True
             feat3.requires_grad = True
@@ -139,8 +161,9 @@ class PinnTrainer:
             pred = self.model(beat, feat1, feat2, feat3)
 
             mse_loss = F.mse_loss(pred, target)
-            physics_loss = self.compute_physics_loss(pred, feat1, feat2, feat3)
-            loss = mse_loss + self.config.physics_loss_weight * physics_loss
+            loss = mse_loss
+            # physics_loss = self.compute_physics_loss(pred, feat1, feat2, feat3)
+            # loss = mse_loss + self.config.physics_loss_weight * physics_loss
 
             loss.backward()
             self.optimizer.step()
@@ -148,6 +171,58 @@ class PinnTrainer:
             total_loss += loss.item()
 
         return total_loss / len(train_loader)
+
+
+class PinnInference:
+    def __init__(self, model_path, device):
+        """
+        저장된 모델을 불러와서 inference를 수행하는 클래스입니다.
+        Args:
+            model_path: 저장된 모델 파일 경로
+            device: 연산을 수행할 디바이스 (CPU/GPU)
+        """
+        self.device = device
+
+        # 저장된 모델 상태 불러오기
+        checkpoint = torch.load(model_path, map_location=device)
+
+        # 설정 불러오기
+        self.config = ModelConfig(**checkpoint["model_config"])
+
+        # 모델 초기화
+        self.model = PinnModel(
+            n_input=self.config.n_input,
+            n_feat=self.config.n_feat,
+            n_ext=self.config.n_ext,
+        ).to(device)
+
+        # 저장된 가중치 불러오기
+        self.model.load_state_dict(checkpoint["model_state_dict"])
+        self.model.eval()  # 평가 모드로 설정
+
+    def predict(self, beat, feat1, feat2, feat3):
+        """
+        입력 데이터에 대한 예측을 수행합니다.
+        Args:
+            beat: 생체 신호 데이터
+            feat1, feat2, feat3: 특성 데이터
+        Returns:
+            예측값
+        """
+        with torch.no_grad():
+            beat = torch.FloatTensor(beat).to(self.device)
+            feat1 = torch.FloatTensor([feat1]).to(self.device)
+            feat2 = torch.FloatTensor([feat2]).to(self.device)
+            feat3 = torch.FloatTensor([feat3]).to(self.device)
+
+            if beat.dim() == 1:
+                beat = beat.unsqueeze(0)
+                feat1 = feat1.unsqueeze(0)
+                feat2 = feat2.unsqueeze(0)
+                feat3 = feat3.unsqueeze(0)
+
+            pred = self.model(beat, feat1, feat2, feat3)
+            return pred.cpu().numpy()
 
 
 def main():
@@ -159,7 +234,10 @@ def main():
 
     df = pd.read_pickle("data_demo_pinn_bioz_bp", compression="gzip")
     dataset = PinnDataset(
-        df=df, beat_key="bioz_beats", feat_keys=["phys_feat_1", "phys_feat_2", "phys_feat_3"], out_key="sys"
+        df=df,
+        beat_key="bioz_beats",
+        feat_keys=["phys_feat_1", "phys_feat_2", "phys_feat_3"],
+        out_key="sys",
     )
     train_loader = DataLoader(dataset, batch_size=config.batch_size, shuffle=True)
     model = PinnModel(
@@ -170,6 +248,10 @@ def main():
     for epoch in range(config.epochs):
         train_loss = trainer.train_epoch(train_loader)
         print(f"Epoch {epoch + 1}/{config.epochs}, Train Loss: {train_loss:.4f}")
+        if train_loss < 0.01:
+            break
+
+    trainer.save_model("pinn_model.pth")
 
 
 if __name__ == "__main__":
