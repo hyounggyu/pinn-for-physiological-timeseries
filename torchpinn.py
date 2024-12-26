@@ -70,27 +70,26 @@ class PinnModel(nn.Module):
 
 
 class PinnDataset(Dataset):
-    def __init__(self, df, beat_key, feat_keys, out_key, transform=True):
+    def __init__(self, df, beat_key, feat_keys, out_key):
         self.beat_data = df[beat_key].values
         self.features = [df[key].values for key in feat_keys]
         self.targets = df[out_key].values
 
-        if transform:
-            self.beat_scaler = StandardScaler()
-            self.feat_scalers = [StandardScaler() for _ in feat_keys]
-            self.target_scaler = StandardScaler()
+        self.beat_scaler = StandardScaler()
+        self.feat_scalers = [StandardScaler() for _ in feat_keys]
+        self.target_scaler = StandardScaler()
 
-            self.beat_data = np.vstack(self.beat_data)
-            self.beat_data = self.beat_scaler.fit_transform(self.beat_data).reshape(
-                len(df), -1
+        self.beat_data = np.vstack(self.beat_data)
+        self.beat_data = self.beat_scaler.fit_transform(self.beat_data).reshape(
+            len(df), -1
+        )
+
+        for i, feature in enumerate(self.features):
+            self.features[i] = self.feat_scalers[i].fit_transform(
+                feature.reshape(-1, 1)
             )
 
-            for i, feature in enumerate(self.features):
-                self.features[i] = self.feat_scalers[i].fit_transform(
-                    feature.reshape(-1, 1)
-                )
-
-            self.targets = self.target_scaler.fit_transform(self.targets.reshape(-1, 1))
+        self.targets = self.target_scaler.fit_transform(self.targets.reshape(-1, 1))
 
     def __len__(self):
         return len(self.beat_data)
@@ -109,7 +108,7 @@ class PinnTrainer:
         self.config = config
         self.optimizer = torch.optim.Adam(model.parameters(), lr=config.learning_rate)
 
-    def save_model(self, path):
+    def save_model(self, path, dataset):
         """
         모델의 가중치와 함께 스케일러 정보도 저장합니다.
         Args:
@@ -126,6 +125,26 @@ class PinnTrainer:
                 "epochs": self.config.epochs,
                 "seed": self.config.seed,
                 "physics_loss_weight": self.config.physics_loss_weight,
+            },
+            "scalers": {
+                "beat_scaler": {
+                    "scale_": dataset.beat_scaler.scale_,
+                    "mean_": dataset.beat_scaler.mean_,
+                    "var_": dataset.beat_scaler.var_,
+                    "n_samples_seen_": dataset.beat_scaler.n_samples_seen_
+                },
+                "feat_scalers": [{
+                    "scale_": scaler.scale_,
+                    "mean_": scaler.mean_,
+                    "var_": scaler.var_,
+                    "n_samples_seen_": scaler.n_samples_seen_
+                } for scaler in dataset.feat_scalers],
+                "target_scaler": {
+                    "scale_": dataset.target_scaler.scale_,
+                    "mean_": dataset.target_scaler.mean_,
+                    "var_": dataset.target_scaler.var_,
+                    "n_samples_seen_": dataset.target_scaler.n_samples_seen_
+                }
             }
         }
         torch.save(model_state, path)
@@ -189,6 +208,37 @@ class PinnInference:
         # 설정 불러오기
         self.config = ModelConfig(**checkpoint["model_config"])
 
+        # 스케일러 초기화 및 파라미터 설정
+        self.beat_scaler = StandardScaler()
+
+        # 저장된 파라미터들을 설정합니다
+        scaler_params = checkpoint["scalers"]["beat_scaler"]
+        self.beat_scaler.fit(np.zeros((1, len(scaler_params["mean_"]))))
+        self.beat_scaler.scale_ = scaler_params["scale_"]
+        self.beat_scaler.mean_ = scaler_params["mean_"]
+        self.beat_scaler.var_ = scaler_params["var_"]
+        self.beat_scaler.n_samples_seen_ = scaler_params["n_samples_seen_"]
+        
+        # 특성 스케일러들을 초기화합니다
+        self.feat_scalers = []
+        for scaler_params in checkpoint["scalers"]["feat_scalers"]:
+            scaler = StandardScaler()
+            scaler.fit(np.zeros((1, 1)))  # 속성 초기화
+            scaler.scale_ = scaler_params["scale_"]
+            scaler.mean_ = scaler_params["mean_"]
+            scaler.var_ = scaler_params["var_"]
+            scaler.n_samples_seen_ = scaler_params["n_samples_seen_"]
+            self.feat_scalers.append(scaler)
+            
+        # 타겟 스케일러를 초기화합니다
+        self.target_scaler = StandardScaler()
+        self.target_scaler.fit(np.zeros((1, 1)))  # 속성 초기화
+        scaler_params = checkpoint["scalers"]["target_scaler"]
+        self.target_scaler.scale_ = scaler_params["scale_"]
+        self.target_scaler.mean_ = scaler_params["mean_"]
+        self.target_scaler.var_ = scaler_params["var_"]
+        self.target_scaler.n_samples_seen_ = scaler_params["n_samples_seen_"]
+
         # 모델 초기화
         self.model = PinnModel(
             n_input=self.config.n_input,
@@ -210,10 +260,15 @@ class PinnInference:
             예측값
         """
         with torch.no_grad():
-            beat = torch.FloatTensor(beat).to(self.device)
-            feat1 = torch.FloatTensor([feat1]).to(self.device)
-            feat2 = torch.FloatTensor([feat2]).to(self.device)
-            feat3 = torch.FloatTensor([feat3]).to(self.device)
+            beat_scaled = self.beat_scaler.transform(beat.reshape(1, -1))
+            feat1_scaled = self.feat_scalers[0].transform([[feat1]])
+            feat2_scaled = self.feat_scalers[1].transform([[feat2]])
+            feat3_scaled = self.feat_scalers[2].transform([[feat3]])
+
+            beat = torch.FloatTensor(beat_scaled).to(self.device)
+            feat1 = torch.FloatTensor(feat1_scaled).to(self.device)
+            feat2 = torch.FloatTensor(feat2_scaled).to(self.device)
+            feat3 = torch.FloatTensor(feat3_scaled).to(self.device)
 
             if beat.dim() == 1:
                 beat = beat.unsqueeze(0)
@@ -221,8 +276,9 @@ class PinnInference:
                 feat2 = feat2.unsqueeze(0)
                 feat3 = feat3.unsqueeze(0)
 
-            pred = self.model(beat, feat1, feat2, feat3)
-            return pred.cpu().numpy()
+            pred_scaled = self.model(beat, feat1, feat2, feat3)
+            pred = self.target_scaler.inverse_transform(pred_scaled.cpu().numpy())
+            return pred
 
 
 def main():
@@ -251,7 +307,7 @@ def main():
         if train_loss < 0.01:
             break
 
-    trainer.save_model("pinn_model.pth")
+    trainer.save_model("pinn_model.pth", dataset)
 
 
 if __name__ == "__main__":
